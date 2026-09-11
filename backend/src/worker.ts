@@ -1,4 +1,3 @@
-
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { pool, withTransaction } from './db';
@@ -8,11 +7,16 @@ import { decideRetry, STALE_LOCK_THRESHOLD_MS } from './retryPolicy';
 dotenv.config();
 
 const WORKER_ID = `${process.env.WORKER_NAME || 'worker'}-${process.pid}-${crypto.randomUUID().slice(0, 8)}`;
+
 const POLL_INTERVAL_MS = parseInt(
   process.env.WORKER_POLL_INTERVAL_MS || '2000',
   10
 );
-const BATCH_SIZE = parseInt(process.env.WORKER_BATCH_SIZE || '5', 10);
+
+const BATCH_SIZE = parseInt(
+  process.env.WORKER_BATCH_SIZE || '5',
+  10
+);
 
 let workerStarted = false;
 let workerStopping = false;
@@ -26,8 +30,15 @@ let workerStopping = false;
 async function claimBatch(): Promise<any[]> {
   return withTransaction(async (client) => {
     const { rows } = await client.query(
-      `SELECT e.*, j.target_url, j.http_method, j.headers, j.body, j.timeout_ms,
-              j.max_retries, j.retry_backoff_base_ms, j.status as job_status,
+      `SELECT e.*, 
+              j.target_url,
+              j.http_method,
+              j.headers,
+              j.body,
+              j.timeout_ms,
+              j.max_retries,
+              j.retry_backoff_base_ms,
+              j.status AS job_status,
               j.allow_concurrent_runs
        FROM executions e
        JOIN jobs j ON j.id = e.job_id
@@ -40,9 +51,11 @@ async function claimBatch(): Promise<any[]> {
       [BATCH_SIZE]
     );
 
-    if (rows.length === 0) return [];
+    if (rows.length === 0) {
+      return [];
+    }
 
-    const ids = rows.map((r) => r.id);
+    const ids = rows.map((row) => row.id);
 
     await client.query(
       `UPDATE executions
@@ -50,7 +63,7 @@ async function claimBatch(): Promise<any[]> {
            locked_by = $1,
            locked_at = now(),
            started_at = now(),
-           version = version + 1
+           version = executions.version + 1
        WHERE id = ANY($2::uuid[])`,
       [WORKER_ID, ids]
     );
@@ -59,6 +72,12 @@ async function claimBatch(): Promise<any[]> {
   });
 }
 
+/**
+ * Executes one claimed execution and records the result.
+ *
+ * Failed executions are passed through the retry policy. Retry creation
+ * is idempotent because each retry has a deterministic idempotency key.
+ */
 async function processExecution(row: any) {
   const result = await executeHttpJob({
     targetUrl: row.target_url,
@@ -76,8 +95,9 @@ async function processExecution(row: any) {
            response_status = $1,
            response_body = $2,
            duration_ms = $3,
-           version = version + 1
-       WHERE id = $4 AND locked_by = $5`,
+           version = executions.version + 1
+       WHERE id = $4
+         AND locked_by = $5`,
       [
         result.status,
         result.bodySnippet,
@@ -102,8 +122,9 @@ async function processExecution(row: any) {
          response_body = $2,
          error_message = $3,
          duration_ms = $4,
-         version = version + 1
-     WHERE id = $5 AND locked_by = $6`,
+         version = executions.version + 1
+     WHERE id = $5
+       AND locked_by = $6`,
     [
       result.status ?? null,
       result.bodySnippet ?? null,
@@ -121,7 +142,9 @@ async function processExecution(row: any) {
   });
 
   if (decision.shouldRetry) {
-    const scheduledFor = new Date(Date.now() + decision.delayMs);
+    const scheduledFor = new Date(
+      Date.now() + decision.delayMs
+    );
 
     await pool.query(
       `INSERT INTO executions
@@ -159,36 +182,57 @@ async function processExecution(row: any) {
 
 /**
  * Reclaims executions stuck in RUNNING because the worker that claimed them
- * died mid-execution.
+ * died or crashed before completing them.
  *
- * A stale execution is first marked FAILED and then passed through the same
- * retry policy used by normal execution failures. This keeps failure recovery
- * consistent and allows crashed executions to resume automatically.
+ * Stale executions are marked FAILED and then passed through the same retry
+ * policy as normal execution failures.
+ *
+ * The stale update intentionally avoids UPDATE ... FROM so that columns such
+ * as "version" cannot become ambiguous between executions and jobs.
  */
 async function reapStaleExecutions() {
   await withTransaction(async (client) => {
     const { rows } = await client.query(
-      `UPDATE executions e
+      `UPDATE executions
        SET status = 'FAILED',
            finished_at = now(),
            error_message = 'Worker lost/crashed mid-execution (stale lock reclaimed)',
-           version = e.version + 1
-       FROM jobs j
-       WHERE e.job_id = j.id
-         AND e.status = 'RUNNING'
-         AND e.locked_at < now() - interval '${STALE_LOCK_THRESHOLD_MS} milliseconds'
-       RETURNING e.*, j.max_retries, j.retry_backoff_base_ms, j.allow_concurrent_runs`
+           version = executions.version + 1
+       WHERE executions.status = 'RUNNING'
+         AND executions.locked_at < now() - interval '${STALE_LOCK_THRESHOLD_MS} milliseconds'
+       RETURNING *`
     );
 
     for (const row of rows) {
+      const { rows: jobRows } = await client.query(
+        `SELECT max_retries,
+                retry_backoff_base_ms,
+                allow_concurrent_runs
+         FROM jobs
+         WHERE id = $1`,
+        [row.job_id]
+      );
+
+      const job = jobRows[0];
+
+      if (!job) {
+        console.warn(
+          `[worker ${WORKER_ID}] reaped stale execution ${row.id}; job not found`
+        );
+
+        continue;
+      }
+
       const decision = decideRetry({
         attemptNumber: row.attempt_number,
-        maxRetries: row.max_retries,
-        baseBackoffMs: row.retry_backoff_base_ms,
+        maxRetries: job.max_retries,
+        baseBackoffMs: job.retry_backoff_base_ms,
       });
 
       if (decision.shouldRetry) {
-        const scheduledFor = new Date(Date.now() + decision.delayMs);
+        const scheduledFor = new Date(
+          Date.now() + decision.delayMs
+        );
 
         await client.query(
           `INSERT INTO executions
@@ -210,7 +254,7 @@ async function reapStaleExecutions() {
             row.id,
             `retry-${row.id}-attempt-${decision.nextAttemptNumber}`,
             scheduledFor,
-            !row.allow_concurrent_runs,
+            !job.allow_concurrent_runs,
           ]
         );
 
@@ -226,6 +270,13 @@ async function reapStaleExecutions() {
   });
 }
 
+/**
+ * Runs one worker cycle:
+ *
+ * 1. Recover stale executions.
+ * 2. Claim pending executions.
+ * 3. Process claimed executions concurrently.
+ */
 async function tick() {
   try {
     await reapStaleExecutions();
@@ -243,19 +294,29 @@ async function tick() {
       )
     );
   } catch (err) {
-    console.error(`[worker ${WORKER_ID}] tick error`, err);
+    console.error(
+      `[worker ${WORKER_ID}] tick error`,
+      err
+    );
   }
 }
 
 /**
  * Starts the worker polling loop inside the current Node.js process.
  *
- * This is used by the Render API Web Service so the application can run
- * the HTTP API, scheduler, and execution worker in one free instance.
+ * Used by the Render API Web Service so the application can run:
+ * - HTTP API
+ * - Scheduler
+ * - Execution worker
+ *
+ * in one free instance.
  */
 export function startWorker() {
   if (workerStarted) {
-    console.log(`[worker ${WORKER_ID}] already started`);
+    console.log(
+      `[worker ${WORKER_ID}] already started`
+    );
+
     return;
   }
 
@@ -276,7 +337,10 @@ export function startWorker() {
   };
 
   run().catch((err) => {
-    console.error(`[worker ${WORKER_ID}] worker crashed`, err);
+    console.error(
+      `[worker ${WORKER_ID}] worker crashed`,
+      err
+    );
   });
 }
 
@@ -285,21 +349,27 @@ export function startWorker() {
  */
 export function stopWorker() {
   workerStopping = true;
-  console.log(`[worker ${WORKER_ID}] stopping`);
+
+  console.log(
+    `[worker ${WORKER_ID}] stopping`
+  );
 }
 
 /**
- * Keep the original standalone worker behavior for local Docker usage.
+ * Keep standalone worker behavior for local Docker usage.
  *
- * When worker.ts is executed directly, it still runs as a dedicated worker.
- * When imported by index.ts, it does NOT automatically start.
+ * When worker.ts is executed directly, it starts as a dedicated worker.
+ * When imported by index.ts, it does not automatically start.
  */
 if (require.main === module) {
   startWorker();
 
   const shutdown = () => {
     stopWorker();
-    setTimeout(() => process.exit(0), 100);
+
+    setTimeout(() => {
+      process.exit(0);
+    }, 100);
   };
 
   process.on('SIGTERM', shutdown);
