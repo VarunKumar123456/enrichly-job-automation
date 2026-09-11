@@ -8,7 +8,10 @@ import { decideRetry, STALE_LOCK_THRESHOLD_MS } from './retryPolicy';
 dotenv.config();
 
 const WORKER_ID = `${process.env.WORKER_NAME || 'worker'}-${process.pid}-${crypto.randomUUID().slice(0, 8)}`;
-const POLL_INTERVAL_MS = parseInt(process.env.WORKER_POLL_INTERVAL_MS || '2000', 10);
+const POLL_INTERVAL_MS = parseInt(
+  process.env.WORKER_POLL_INTERVAL_MS || '2000',
+  10
+);
 const BATCH_SIZE = parseInt(process.env.WORKER_BATCH_SIZE || '5', 10);
 
 let workerStarted = false;
@@ -169,7 +172,7 @@ async function reapStaleExecutions() {
        SET status = 'FAILED',
            finished_at = now(),
            error_message = 'Worker lost/crashed mid-execution (stale lock reclaimed)',
-           version = version + 1
+           version = e.version + 1
        FROM jobs j
        WHERE e.job_id = j.id
          AND e.status = 'RUNNING'
