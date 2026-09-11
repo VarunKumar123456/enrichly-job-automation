@@ -1,180 +1,1200 @@
 # Engineering Notes
 
-## Architecture
+## 1. Architecture
 
+```text
+                         Browser
+                            |
+                            | REST + JWT
+                            v
+                  +----------------------+
+                  |      Next.js FE      |
+                  +----------+-----------+
+                             |
+                             | HTTP
+                             v
+                  +----------------------+
+                  |      Express API     |
+                  |                      |
+                  |  Scheduler loop      |
+                  |  Worker loop         |
+                  +----------+-----------+
+                             |
+                             | PostgreSQL
+                             v
+                  +----------------------+
+                  |     PostgreSQL       |
+                  |                      |
+                  | jobs                 |
+                  | executions           |
+                  +----------------------+
 ```
-                 ┌─────────────┐
-   Browser ───▶  │  Next.js FE │
-                 └──────┬──────┘
-                        │ REST (JWT)
-                 ┌──────▼──────┐        ┌────────────┐
-                 │  Express API│───────▶│  Scheduler  │ (in-process loop)
-                 └──────┬──────┘        └─────┬──────┘
-                        │                     │ inserts PENDING executions
-                 ┌──────▼─────────────────────▼──────┐
-                 │           PostgreSQL               │
-                 │  jobs · executions                 │
-                 └──────┬─────────────────────┬───────┘
-                        │ SELECT ... FOR UPDATE SKIP LOCKED
-                 ┌──────▼──────┐       ┌──────▼──────┐
-                 │  Worker #1  │       │  Worker #2  │  ... (N replicas)
-                 └─────────────┘       └─────────────┘
+
+The system has three logical layers:
+
+1. **Frontend** — Next.js/React UI for authentication, job management, execution history, filtering, retrying, and cancellation.
+2. **API** — Express/TypeScript REST API responsible for authentication, authorization, validation, job CRUD, manual execution requests, and scheduler/worker lifecycle.
+3. **PostgreSQL** — persistent source of truth for job configuration, execution state, locking, idempotency, retries, and history.
+
+The worker implementation is separated into its own module and can run independently from the API.
+
+### Production deployment trade-off
+
+The production deployment runs the scheduler and one worker loop inside the API Node.js process.
+
+This was an intentional free-tier deployment decision.
+
+Render's free web-service tier does not provide a free dedicated Background Worker service. Rather than deploy an architecture that required a paid service, the application keeps the execution worker logically separated in code while allowing it to run in-process.
+
+The worker lifecycle is controlled through:
+
+```text
+startWorker()
+stopWorker()
 ```
 
-Four processes: the Next.js frontend, the Express API (which also runs the
-scheduler loop in-process by default), and one or more worker processes.
-API and workers only communicate through Postgres — there's no direct
-RPC between them. That's deliberate: it means workers can be scaled
-horizontally (`docker compose up --scale worker=3`) with zero code changes,
-and a worker dying doesn't take anything else down with it.
+and environment configuration:
 
-**Stack deviation from the brief:** the brief's preferred stack was
-Next.js + React + TS + .NET/C# + Postgres. I used Node/Express instead of
-.NET for the backend. Reason: I built and tested this end-to-end, including
-running the actual API + worker processes and hitting a live external API
-to prove the retry logic under a real failure — and my available toolchain
-could reach the npm registry but not NuGet. Rather than hand over
-architecture I couldn't verify actually runs, I kept one runtime (Node) so
-every claim in this document is backed by a passing test or a real
-execution log, not just a design on paper. The design translates directly
-to .NET (Postgres advisory/row locking works the same way via Npgsql +
-Dapper/EF Core; the state machine and schema are runtime-agnostic) and I'm
-glad to walk through that translation.
+```text
+RUN_WORKER_IN_API=true
+```
 
-## How jobs are picked up and executed
+This means the production deployment can remain on the free tier without changing the execution model itself.
 
-A job's `cron_expression` (if any) drives a scheduler loop that, once per
-poll interval, finds jobs whose `next_run_at` is due and inserts a `PENDING`
-execution row, then advances `next_run_at`. Manual triggers ("Run Now")
-insert a `PENDING` row directly from the API.
+If deployed to infrastructure with dedicated background workers, the worker can be run as a separate process using the same database coordination mechanism.
 
-Workers never talk to the API — they poll Postgres directly on a fixed
-interval. Each poll:
+---
 
-1. Reaps any `RUNNING` execution whose lock is older than 90s (see "Worker
-   failures" below).
-2. Claims a batch of due `PENDING` rows with
-   `SELECT ... FOR UPDATE SKIP LOCKED`, stamps them `RUNNING` with this
-   worker's ID, in one transaction.
-3. Executes the HTTP call for each claimed row, records the result.
+# 2. Stack
 
-## How concurrency is handled (the core requirement)
+The assignment's preferred stack was:
 
-`FOR UPDATE SKIP LOCKED` is the load-bearing piece. When N workers poll at
-the same instant, each starts a transaction and tries to lock the same
-candidate rows. Postgres lets exactly one transaction hold the lock on
-any given row; the others skip it instead of blocking or erroring. This
-means two workers can never both claim the same execution — not "very
-rarely," structurally never, because it's enforced by the database's own
-row-locking, not by application-level coordination that could race.
+```text
+Next.js + React + TypeScript + .NET/C# + PostgreSQL
+```
 
-**I didn't just assert this — I proved it two ways:**
-- `tests/concurrency.integration.test.ts` spins up 8 concurrent "workers"
-  against a real Postgres instance racing to drain 20 pending executions,
-  and asserts zero duplicate claims.
-- I ran the actual compiled worker and API processes locally, triggered a
-  job against a real external API, and watched the claim → execute →
-  fail → backoff → retry cycle happen for real in the logs (see the
-  execution history screenshots / logs referenced in the submission email).
+I used:
 
-A second, independent guard exists at the schema level: a partial unique
-index (`uq_job_single_inflight`) prevents a job that doesn't allow
-concurrent runs from ever having more than one `PENDING`/`RUNNING`
-execution at a time — enforced by Postgres itself, so it holds even if two
-API instances raced on the same "Run Now" click.
+```text
+Next.js + React + TypeScript
+Node.js + Express + TypeScript
+PostgreSQL
+```
 
-## How retries and failures work
+The frontend matches the preferred stack directly.
 
-Each execution attempt is its own row, chained via `parent_execution_id`.
-On failure, `decideRetry()` (a pure function, unit tested independently of
-the DB) checks `attempt_number` against the job's `max_retries` and, if
-retries remain, computes an exponential backoff (`base * 2^(attempt-1)`,
-capped at 5 minutes, plus up to 20% jitter to avoid a thundering herd if
-many jobs fail around the same time) and inserts the next attempt as a new
-`PENDING` row scheduled in the future. A manually-triggered retry (clicking
-"Retry" on a failed execution in the UI) works the same way, bypassing the
-"only FAILED can retry" gate.
+The backend differs from the preferred .NET/C# choice.
 
-**Idempotency** is enforced via a unique `(job_id, idempotency_key)` index.
-Manual triggers accept an `Idempotency-Key` header so a flaky client retry
-of the HTTP request itself doesn't create a second execution; the
-scheduler derives its own key from `(job_id, scheduled_for)` so a scheduler
-restart can't double-enqueue a tick it already handled.
+## Why Node instead of .NET?
 
-**Worker failures**: if a worker dies mid-execution, its claimed rows stay
-`RUNNING` with a `locked_at` timestamp that stops advancing. A reaper
-(run at the top of every poll tick, by every worker) finds `RUNNING` rows
-whose lock is older than 90 seconds and marks them `FAILED` so the normal
-retry path picks them back up. This trades a worst-case 90s detection
-delay for simplicity — no separate heartbeat process to run or fail.
+The primary reason was execution confidence.
 
-**External failures** (timeout, non-2xx, network error, DNS failure) are
-all funneled through the same code path in `httpExecutor.ts` and treated
-as a failed execution, not a thrown exception — so retry logic doesn't
-need to special-case "was it a timeout or a 500."
+I wanted to verify the complete system end-to-end rather than provide a partially verified implementation. The available development environment had a reliable Node/npm toolchain, while the NuGet tooling required for the preferred backend was not available for the same workflow.
 
-## Important database decisions
+Using Node allowed me to:
 
-- **Optimistic locking via a `version` column** on `jobs`. Every update
-  requires the client's last-known version; a mismatch returns `409`
-  instead of silently overwriting a concurrent edit. Proven by
-  `tests/api.integration.test.ts` (client A saves, client B's stale save
-  is rejected).
-- **`enforce_single_inflight` is denormalized onto `executions`**, copied
-  from the job's `allow_concurrent_runs` at insert time. I initially wrote
-  the partial unique index directly against `jobs.allow_concurrent_runs`
-  and only caught during integration testing that a partial index can't
-  reference another table's column — Postgres doesn't allow it. Copying
-  the one relevant bit onto the row it governs was the fix; it's a real
-  trade-off (a job's setting change doesn't retroactively affect
-  already-queued executions) that I'm noting rather than hiding.
-- Indexes are built around the two hot queries: "find due PENDING work"
-  (`idx_executions_claimable`) and "find stale RUNNING work"
-  (`idx_executions_running_locked`), both partial indexes so they stay
-  small as history accumulates.
-- `response_body` is truncated to 4000 characters on write — enough to
-  debug a failure, not enough for one huge response to bloat the table.
+* Build the API completely
+* Run the worker locally
+* Run PostgreSQL integration tests
+* Exercise real concurrent claims
+* Test retries against a real external HTTP endpoint
+* Deploy the API and worker logic
+* Verify the production deployment
 
-## Product decisions
+The important architectural pieces are runtime-independent:
 
-- Jobs are modeled as a single `HTTP_CALL` type (configurable method,
-  headers, body, timeout) rather than a family of job types. This covers
-  "call an API," "trigger a webhook," and "run a background process" (if
-  that process exposes an HTTP trigger) with one execution path. "Sync
-  data between two systems" is the one example from the brief this
-  doesn't directly cover without also building a second job type — noted
-  under Known Limitations rather than half-implemented.
-- Chose search + filtering, cancellation, and job statistics from the
-  "beyond minimum" list, over notifications/real-time updates/worker
-  health — these felt like the highest-value additions a developer using
-  this tool would actually reach for first.
-- The dashboard polls every 4 seconds rather than using websockets/SSE.
-  Simpler, and sufficient for a job automation tool where seconds of
-  staleness on a status pill doesn't matter — a fair trade against the
-  added complexity of a push channel.
+* PostgreSQL transactions
+* Row locking
+* `FOR UPDATE SKIP LOCKED`
+* Unique constraints
+* Idempotency
+* Optimistic locking
+* Execution state transitions
+* Retry chains
 
-## Known limitations
+A .NET implementation would use the same database model and concurrency semantics, for example through Npgsql with Dapper or EF Core.
 
-- No real-time push (polling only) — noted above.
-- Single job "type" (generic HTTP call) rather than a pluggable job-type
-  system; adding a second type (e.g. "run a shell command in a sandboxed
-  container") would need a small strategy-pattern refactor of
-  `httpExecutor.ts` into a `JobExecutor` interface.
-- The stale-worker reaper has a 90-second detection floor — acceptable for
-  this scope, but a production system would likely add a lighter-weight
-  heartbeat to shrink that window.
-- No rate limiting on the API itself (only on outbound calls via timeout).
-- Test coverage is deliberately narrow-but-real: 21 tests total, all
-  either pure unit tests or integration tests against a live Postgres +
-  live Express app — no mocked DB calls, so a passing suite means the
-  claimed behavior actually happened, not just that a mock returned what
-  I told it to.
+The decision was therefore to submit a fully working and tested Node implementation rather than an unverified .NET implementation.
 
-## What I'd improve with more time
+---
 
-- Pluggable job-type system (webhook vs. scheduled shell command vs. data
-  sync) behind a shared `JobExecutor` interface.
-- Websocket/SSE push for execution status instead of polling.
-- Structured log aggregation per execution (currently just `response_body`
-  + `error_message`) for multi-step jobs.
-- A lighter worker heartbeat to shrink the 90s stale-detection window.
+# 3. Job model
+
+A job represents an HTTP-based automated task.
+
+The current job type is intentionally:
+
+```text
+HTTP_CALL
+```
+
+It can represent:
+
+* REST API calls
+* Webhooks
+* External service triggers
+
+A job contains configuration such as:
+
+* Name
+* Description
+* Target URL
+* HTTP method
+* Headers
+* Request body
+* Timeout
+* Cron expression
+* Maximum retries
+* Retry backoff
+* Concurrent-run policy
+
+This keeps the implementation focused on the central automation problem instead of introducing multiple partially implemented job types.
+
+---
+
+# 4. Execution model
+
+Every execution attempt is represented by a row in the `executions` table.
+
+An execution includes:
+
+* Job ID
+* Status
+* Trigger source
+* Attempt number
+* Parent execution ID
+* Idempotency key
+* Scheduled timestamp
+* Worker lock information
+* Start/finish timestamps
+* Response status
+* Response body snippet
+* Error message
+* Duration
+* Version
+
+The execution status lifecycle is approximately:
+
+```text
+PENDING
+   |
+   | worker claims
+   v
+RUNNING
+   |
+   +---------> SUCCEEDED
+   |
+   +---------> FAILED
+                   |
+                   | retry available
+                   v
+                 PENDING
+```
+
+Each retry is a new execution row.
+
+This provides a complete audit trail instead of overwriting the original failed attempt.
+
+---
+
+# 5. How jobs are scheduled
+
+Jobs may optionally contain a cron expression.
+
+The scheduler loop runs periodically.
+
+On each scheduler iteration:
+
+1. Find active jobs whose `next_run_at` is due.
+2. Lock the candidate job row.
+3. Insert a `PENDING` execution.
+4. Generate a deterministic idempotency key based on the job and scheduled timestamp.
+5. Advance `next_run_at`.
+6. Commit the transaction.
+
+The scheduler uses database locking so multiple scheduler instances can safely compete for due jobs.
+
+The deterministic idempotency key prevents the same scheduled tick from being inserted twice.
+
+---
+
+# 6. How manual execution works
+
+The **Run Now** API endpoint creates a `PENDING` execution.
+
+The request:
+
+1. Authenticates the user.
+2. Verifies that the user owns the job.
+3. Validates the request.
+4. Determines the idempotency key.
+5. Determines whether the job allows overlapping executions.
+6. Inserts the execution.
+7. Returns the created/deduplicated execution result.
+
+Manual execution requests support an `Idempotency-Key` header.
+
+If a client retries the same HTTP request because of a timeout or network problem, the same idempotency key prevents a second execution from being created.
+
+---
+
+# 7. Worker pickup
+
+Workers poll PostgreSQL for pending work.
+
+A worker performs three main actions on each tick:
+
+1. Reap stale executions.
+2. Claim pending executions.
+3. Execute the claimed HTTP calls.
+
+The claim query uses:
+
+```sql
+SELECT ...
+FROM executions
+JOIN jobs ...
+WHERE executions.status = 'PENDING'
+  AND executions.scheduled_for <= now()
+  AND jobs.status = 'ACTIVE'
+ORDER BY executions.scheduled_for
+LIMIT ...
+FOR UPDATE OF executions SKIP LOCKED
+```
+
+The selected executions are then changed to:
+
+```text
+RUNNING
+```
+
+with:
+
+* `locked_by`
+* `locked_at`
+* `started_at`
+
+The claim and state transition happen in the same transaction.
+
+---
+
+# 8. Concurrency: `FOR UPDATE SKIP LOCKED`
+
+This is the load-bearing concurrency mechanism.
+
+Suppose multiple workers poll at the same time:
+
+```text
+Worker A ──┐
+Worker B ──┼──> PostgreSQL
+Worker C ──┘
+```
+
+All workers may find the same pending rows.
+
+PostgreSQL row locking ensures that only one transaction can hold the lock on a given execution.
+
+Other workers use:
+
+```sql
+SKIP LOCKED
+```
+
+so they skip rows already claimed by another transaction.
+
+The result is:
+
+```text
+Execution 1 → Worker A
+Execution 2 → Worker B
+Execution 3 → Worker C
+```
+
+rather than:
+
+```text
+Execution 1 → Worker A
+Execution 1 → Worker B
+Execution 1 → Worker C
+```
+
+This guarantee is provided by the database rather than application-level timing assumptions.
+
+---
+
+# 9. Concurrency testing
+
+The concurrency behavior is tested against a real PostgreSQL instance.
+
+`concurrency.integration.test.ts` creates pending executions and starts multiple concurrent claimers.
+
+The test verifies:
+
+* Multiple workers can race for pending work.
+* Workers do not claim the same execution.
+* All executions can be drained.
+* Duplicate claims are zero.
+
+The test intentionally does not mock PostgreSQL locking behavior.
+
+This is important because a mock cannot prove that the actual database transaction semantics work correctly.
+
+---
+
+# 10. Single in-flight execution
+
+The product provides a job-level option controlling whether overlapping executions are allowed.
+
+When overlapping executions are disabled, the database contains a partial unique index:
+
+```text
+uq_job_single_inflight
+```
+
+It applies to executions in:
+
+```text
+PENDING
+RUNNING
+```
+
+This means PostgreSQL itself prevents a job from having two active executions simultaneously.
+
+For example:
+
+```text
+Job A
+ |
+ +-- Execution 1 → RUNNING
+ |
+ +-- Execution 2 → rejected
+```
+
+This is stronger than performing a simple application-level:
+
+```text
+if (alreadyRunning) ...
+```
+
+check, because two API requests could otherwise race between the check and insert.
+
+The database constraint closes that race.
+
+---
+
+# 11. Denormalized concurrency flag
+
+The execution table stores:
+
+```text
+enforce_single_inflight
+```
+
+This is copied from the job's `allow_concurrent_runs` setting when an execution is created.
+
+The reason is a PostgreSQL limitation: a partial index cannot directly reference a column from another table.
+
+An initial design attempted to make the index depend directly on:
+
+```text
+jobs.allow_concurrent_runs
+```
+
+but PostgreSQL does not allow that.
+
+The relevant setting was therefore denormalized onto executions.
+
+This has one deliberate consequence:
+
+> Changing a job's concurrency setting does not retroactively change the policy stored on already-created execution rows.
+
+That trade-off is preferable to removing the database-level guarantee.
+
+---
+
+# 12. Idempotency
+
+There are two main idempotency cases.
+
+## Manual requests
+
+Manual execution requests can provide:
+
+```text
+Idempotency-Key
+```
+
+The database has a unique constraint on:
+
+```text
+(job_id, idempotency_key)
+```
+
+Repeated requests with the same key therefore resolve to the same logical execution rather than creating duplicates.
+
+## Scheduled executions
+
+The scheduler derives an idempotency key from:
+
+```text
+job_id + scheduled_for
+```
+
+This means a scheduler restart cannot blindly enqueue the same scheduled tick twice.
+
+---
+
+# 13. Retry design
+
+Failures are handled by a pure retry-policy function.
+
+The policy considers:
+
+* Current attempt number
+* Maximum retries
+* Base backoff
+
+When a retry is available, a new execution row is created.
+
+The retry is linked to the failed attempt through:
+
+```text
+parent_execution_id
+```
+
+This produces an execution chain:
+
+```text
+Manual #1
+    |
+    v
+Retry #2
+    |
+    v
+Retry #3
+    |
+    v
+Retry #4
+```
+
+The UI can therefore show the complete history.
+
+---
+
+# 14. Exponential backoff
+
+Retry delay uses exponential backoff:
+
+```text
+base * 2^(attempt - 1)
+```
+
+with:
+
+* A maximum delay cap
+* Jitter
+
+Jitter reduces the risk of many failed jobs retrying at exactly the same instant.
+
+For example, instead of:
+
+```text
+1000ms
+2000ms
+4000ms
+8000ms
+```
+
+many jobs will have slightly different retry times.
+
+The retry policy is implemented as a pure function and tested independently.
+
+---
+
+# 15. Worker failure recovery
+
+A worker may crash after claiming an execution.
+
+Without recovery, the execution could remain:
+
+```text
+RUNNING
+```
+
+forever.
+
+Each claimed execution therefore records:
+
+```text
+locked_at
+locked_by
+```
+
+Every worker periodically checks for stale locks.
+
+An execution whose lock is older than the configured stale threshold is considered abandoned.
+
+The current threshold is:
+
+```text
+90 seconds
+```
+
+The reaper:
+
+1. Finds stale `RUNNING` executions.
+2. Marks them `FAILED`.
+3. Records a worker-crash error message.
+4. Applies the normal retry policy.
+5. Creates the next retry when retries remain.
+
+This means worker crashes use the same recovery path as normal failures.
+
+---
+
+# 16. Why 90 seconds?
+
+The 90-second threshold is a deliberate trade-off.
+
+A shorter threshold gives faster recovery but increases the risk of incorrectly declaring a genuinely slow execution dead.
+
+A longer threshold improves safety but delays recovery.
+
+For this take-home application, 90 seconds is a reasonable balance.
+
+A production system could replace or supplement this with:
+
+* Worker heartbeats
+* Lease renewal
+* Process health monitoring
+* Dedicated queue infrastructure
+
+---
+
+# 17. External HTTP failures
+
+The HTTP executor treats several failure categories as execution failures:
+
+* Non-2xx responses
+* Timeouts
+* DNS errors
+* Connection failures
+* Network errors
+
+They are normalized into an execution result rather than allowing retry logic to depend on the exact exception type.
+
+This keeps retry behavior centralized.
+
+A failure can therefore follow:
+
+```text
+HTTP call
+   |
+   +-- 500
+   |
+   +-- timeout
+   |
+   +-- DNS failure
+   |
+   +-- network error
+         |
+         v
+      FAILED
+         |
+         v
+    retry policy
+```
+
+---
+
+# 18. Response storage
+
+The response body is truncated before storage.
+
+The current limit is:
+
+```text
+4000 characters
+```
+
+The goal is to preserve enough response information to diagnose failures without allowing one very large HTTP response to unnecessarily consume database storage.
+
+---
+
+# 19. Optimistic locking
+
+Jobs contain a `version` column.
+
+When a client reads a job, it also receives its current version.
+
+An update includes the expected version.
+
+Conceptually:
+
+```sql
+UPDATE jobs
+SET ...
+    version = version + 1
+WHERE id = $1
+  AND version = $expectedVersion
+```
+
+If no row is updated, another client has changed the job.
+
+The API returns:
+
+```text
+409 Conflict
+```
+
+instead of silently overwriting the newer change.
+
+This behavior is covered by integration tests.
+
+---
+
+# 20. Authentication and authorization
+
+Authentication uses:
+
+```text
+bcrypt
+JWT
+```
+
+Users authenticate through the API and receive a JWT.
+
+Protected routes require authentication.
+
+Job ownership is checked before operations such as:
+
+* Reading jobs
+* Updating jobs
+* Deleting jobs
+* Running jobs
+* Reading execution history
+* Retrying executions
+* Cancelling executions
+
+This prevents users from operating on another user's jobs simply by changing an ID in the URL.
+
+---
+
+# 21. Validation
+
+API inputs are validated before database operations.
+
+Validation covers areas such as:
+
+* Job names
+* URLs
+* HTTP methods
+* Timeouts
+* Retry counts
+* Retry backoff
+* Cron expressions
+* Request bodies
+* Concurrency settings
+
+Invalid requests return structured client errors instead of allowing malformed data to reach database queries.
+
+---
+
+# 22. Error handling
+
+The API uses centralized error handling.
+
+Expected errors are converted into appropriate HTTP responses.
+
+Examples include:
+
+```text
+400 Bad Request
+401 Unauthorized
+403 Forbidden
+404 Not Found
+409 Conflict
+```
+
+Unexpected errors are logged by the backend rather than exposed as raw internal implementation details.
+
+---
+
+# 23. Database decisions
+
+PostgreSQL was selected because the assignment's hardest problems are state and concurrency problems rather than simple CRUD.
+
+Important database responsibilities include:
+
+* Persistent job state
+* Execution history
+* Transaction boundaries
+* Worker locking
+* Idempotency
+* Single-inflight guarantees
+* Optimistic locking
+* Retry chains
+* Scheduler coordination
+
+Raw SQL through `pg` was chosen instead of an ORM because the concurrency-critical queries are clearer when their PostgreSQL locking semantics are explicit.
+
+---
+
+# 24. Indexing
+
+Indexes focus on the application's hot paths.
+
+### Claimable executions
+
+A partial index supports:
+
+```text
+PENDING executions
+```
+
+that are eligible for worker pickup.
+
+### Stale executions
+
+Another partial index supports:
+
+```text
+RUNNING executions
+```
+
+with lock timestamps.
+
+Partial indexes keep these hot query paths focused even as execution history grows.
+
+---
+
+# 25. Migrations
+
+Database schema changes are stored in the migrations directory.
+
+The initial migration creates:
+
+* Extensions
+* Enum types
+* Jobs table
+* Executions table
+* Indexes
+* Constraints
+* Triggers/functions where required
+
+The schema is therefore reproducible rather than depending on manually created database objects.
+
+---
+
+# 26. Product decisions
+
+The assignment intentionally leaves the product underdefined.
+
+I chose to focus the UI around the developer/operator workflow:
+
+```text
+Create job
+    ↓
+Run or schedule job
+    ↓
+Monitor execution
+    ↓
+Understand failure
+    ↓
+Retry / cancel / inspect history
+```
+
+The dashboard provides:
+
+* Job status
+* Execution statistics
+* Search
+* Filtering
+* Execution history
+* Failure information
+
+---
+
+# 27. Why HTTP jobs?
+
+A generic HTTP job can represent:
+
+* REST API calls
+* Webhooks
+* Third-party service triggers
+* Internal automation endpoints
+
+This gives useful automation coverage without building multiple execution engines.
+
+The assignment mentions broader possibilities such as data synchronization.
+
+That would require additional job types and execution strategies, so it is explicitly treated as a future extension rather than a partially implemented feature.
+
+---
+
+# 28. Cancellation
+
+Execution cancellation was chosen as one of the higher-value features beyond the basic CRUD requirements.
+
+It gives an operator control over work that has been queued but is no longer desirable.
+
+The implementation focuses on reliable database state transitions rather than pretending to guarantee cancellation of an already-completed external HTTP request.
+
+---
+
+# 29. Dashboard polling
+
+The frontend polls execution/job data approximately every four seconds.
+
+I deliberately chose polling instead of WebSockets or Server-Sent Events.
+
+The reasoning is:
+
+* The application does not require sub-second status updates.
+* Polling is simpler to deploy.
+* Polling reduces backend infrastructure complexity.
+* It keeps the real-time layer out of the critical execution path.
+
+For a larger production system, SSE or WebSockets would be a natural improvement.
+
+---
+
+# 30. Testing strategy
+
+The test suite contains:
+
+```text
+21 tests
+3 suites
+```
+
+The testing strategy prioritizes the risky parts of the system rather than maximizing superficial line coverage.
+
+### Unit tests
+
+The retry policy is tested independently.
+
+### Concurrency integration tests
+
+Real PostgreSQL is used to verify:
+
+* Concurrent worker claims
+* `SKIP LOCKED`
+* No duplicate execution claims
+* Single-inflight protection
+
+### API integration tests
+
+The real Express application is exercised for:
+
+* Authentication
+* Optimistic locking
+* Idempotency
+* Retry behavior
+* Job operations
+
+The intent is to prove system behavior rather than simply test mocked functions.
+
+---
+
+# 31. Real execution verification
+
+In addition to automated tests, the application was exercised against real HTTP endpoints.
+
+A successful execution was verified against:
+
+```text
+https://api.github.com
+```
+
+A failure/retry path was verified against:
+
+```text
+https://httpbin.org/status/500
+```
+
+The production deployment was also exercised after deployment.
+
+This verified the complete path:
+
+```text
+Browser
+  ↓
+API
+  ↓
+PostgreSQL
+  ↓
+Worker
+  ↓
+External HTTP endpoint
+  ↓
+Execution result
+  ↓
+History UI
+```
+
+---
+
+# 32. Failure scenarios
+
+| Scenario                         | Handling                                                  |
+| -------------------------------- | --------------------------------------------------------- |
+| Two workers claim same execution | `FOR UPDATE SKIP LOCKED`                                  |
+| Two Run Now requests             | Partial unique single-inflight constraint                 |
+| Client repeats same request      | Idempotency key                                           |
+| Two clients edit same job        | Optimistic locking                                        |
+| HTTP 500                         | Failed execution + retry policy                           |
+| HTTP timeout                     | Failed execution + retry policy                           |
+| DNS/network failure              | Failed execution + retry policy                           |
+| Worker crashes                   | Stale lock reaper                                         |
+| Scheduler restarts               | Deterministic scheduling idempotency key                  |
+| Invalid cron                     | Job configuration validation/error handling               |
+| Database unavailable             | API/worker logs failure and retries on subsequent polling |
+| External service unavailable     | Execution fails and normal retry policy applies           |
+
+---
+
+# 33. Production deployment
+
+The application is deployed using Render.
+
+The production setup contains:
+
+```text
+Render Web Service
+    |
+    +-- Express API
+    +-- Scheduler loop
+    +-- Worker loop
+             |
+             v
+       Render PostgreSQL
+```
+
+The frontend is deployed as a separate Render web service.
+
+This arrangement was selected to remain within the free-tier constraints.
+
+The worker is not deployed as a separate paid Background Worker in production.
+
+That is an infrastructure decision, not a change to the worker's logical architecture.
+
+---
+
+# 34. Why the worker remains separate in code
+
+The worker has its own module and lifecycle:
+
+```text
+startWorker()
+stopWorker()
+```
+
+This preserves a clean separation between:
+
+```text
+API responsibilities
+Worker responsibilities
+```
+
+The API does not directly execute HTTP jobs.
+
+Instead:
+
+```text
+API
+  ↓
+PostgreSQL
+  ↓
+Worker
+```
+
+The same boundary remains valid whether the worker is:
+
+```text
+inside the API process
+```
+
+or:
+
+```text
+a separate process
+```
+
+This makes the deployment model flexible.
+
+---
+
+# 35. Known limitations
+
+## No WebSocket/SSE
+
+The UI uses polling.
+
+This is sufficient for the assignment but introduces a small delay between backend state changes and UI updates.
+
+---
+
+## One job type
+
+The system currently supports HTTP calls.
+
+A production automation platform would likely expose a job executor abstraction:
+
+```text
+JobExecutor
+   |
+   +-- HttpExecutor
+   +-- WebhookExecutor
+   +-- DataSyncExecutor
+   +-- ...
+```
+
+---
+
+## 90-second stale recovery
+
+Worker failure detection currently has a 90-second threshold.
+
+A heartbeat/lease mechanism would reduce the recovery window.
+
+---
+
+## No API rate limiting
+
+The current API does not include a full rate-limiting layer.
+
+A production deployment should add:
+
+* Request rate limits
+* Per-user limits
+* Abuse protection
+* Outbound concurrency limits
+
+---
+
+## No dedicated distributed queue
+
+PostgreSQL acts as the work coordination mechanism.
+
+For this assignment, that keeps the architecture small and understandable.
+
+At significantly larger scale, a dedicated queue could become preferable.
+
+---
+
+## Test scope
+
+There are 21 tests focused on high-risk behavior.
+
+The suite deliberately prioritizes:
+
+* Concurrency
+* Retry behavior
+* Idempotency
+* Optimistic locking
+* Authentication
+
+rather than attempting broad end-to-end coverage of every UI interaction.
+
+---
+
+# 36. What I would improve with more time
+
+### 1. Dedicated queue
+
+Introduce a durable queue such as a managed message broker for larger-scale workloads.
+
+### 2. Worker heartbeat
+
+Add worker leases/heartbeats to reduce stale execution recovery time.
+
+### 3. Real-time execution updates
+
+Use SSE/WebSockets so execution status changes reach the UI immediately.
+
+### 4. Pluggable executors
+
+Introduce a common `JobExecutor` interface for multiple job types.
+
+### 5. Structured execution logs
+
+Store structured logs per execution rather than only response snippets and error messages.
+
+### 6. Rate limiting
+
+Add API and outbound execution rate controls.
+
+### 7. Better observability
+
+Add:
+
+* Metrics
+* Structured logs
+* Execution latency metrics
+* Retry counts
+* Worker health
+* Alerting
+
+---
+
+# 37. Engineering trade-offs
+
+The main trade-offs were:
+
+| Decision                      | Benefit                                      | Cost                                    |
+| ----------------------------- | -------------------------------------------- | --------------------------------------- |
+| PostgreSQL as queue           | Simple infrastructure and strong consistency | Less specialized than a dedicated queue |
+| Raw SQL                       | Explicit concurrency behavior                | More SQL maintenance                    |
+| `SKIP LOCKED`                 | Strong multi-worker coordination             | PostgreSQL-specific                     |
+| Single-inflight DB constraint | Race-safe guarantee                          | Requires denormalized flag              |
+| Retry rows                    | Complete audit trail                         | More execution records                  |
+| Polling UI                    | Simple deployment                            | Small status delay                      |
+| HTTP-only jobs                | Focused implementation                       | Less extensible job model               |
+| In-process production worker  | Works on free Render tier                    | API and worker share a process          |
+| 90s stale threshold           | Simple crash recovery                        | Recovery is not immediate               |
+| 21 targeted tests             | Strong coverage of risky behavior            | Not exhaustive UI coverage              |
+
+The guiding principle was:
+
+> Prefer a smaller system whose correctness can be demonstrated over a larger system whose reliability is mostly theoretical.
+
+---
+
+# 38. Final architecture summary
+
+The key design choice is that PostgreSQL is not merely the application's CRUD database.
+
+It is also the coordination mechanism for distributed execution.
+
+The critical guarantees are enforced at the database level:
+
+```text
+              PostgreSQL
+                   |
+       +-----------+-----------+
+       |           |           |
+   Row locks   Unique keys  Versions
+       |           |           |
+       v           v           v
+   Worker       Idempotency  Optimistic
+   claims                    locking
+```
+
+This allows multiple worker processes to safely compete for work while preventing duplicate execution.
+
+The worker failure path feeds back into the same retry mechanism as normal execution failures.
+
+The production free-tier deployment runs the scheduler and worker inside the API process, but the logical worker boundary and database coordination remain intact.
+
+The result is a deliberately scoped automation platform focused on the assignment's highest-risk engineering requirements:
+
+* Correct execution
+* Concurrency
+* Idempotency
+* Retries
+* Failure recovery
+* Authentication/authorization
+* Database consistency
+* Testing
+* Deployability
