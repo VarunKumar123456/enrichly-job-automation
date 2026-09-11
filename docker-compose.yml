@@ -1,0 +1,65 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: enrichly
+      POSTGRES_PASSWORD: enrichly
+      POSTGRES_DB: enrichly
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U enrichly']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build: ./backend
+    command: ['node', 'dist/migrate.js']
+    environment:
+      DATABASE_URL: postgresql://enrichly:enrichly@postgres:5432/enrichly
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: ./backend
+    ports:
+      - '4000:4000'
+    environment:
+      DATABASE_URL: postgresql://enrichly:enrichly@postgres:5432/enrichly
+      JWT_SECRET: change-me-in-production
+      PORT: 4000
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build: ./backend
+    command: ['node', 'dist/worker.js']
+    environment:
+      DATABASE_URL: postgresql://enrichly:enrichly@postgres:5432/enrichly
+      WORKER_POLL_INTERVAL_MS: 2000
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # Run `docker compose up --scale worker=3` to prove multiple workers
+    # never double-process the same execution (see tests/concurrency.integration.test.ts
+    # for the same guarantee proven directly against Postgres).
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:4000
+    ports:
+      - '3000:3000'
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
